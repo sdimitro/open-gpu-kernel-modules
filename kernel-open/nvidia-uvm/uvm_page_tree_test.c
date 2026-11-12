@@ -1410,6 +1410,155 @@ done:
     return status;
 }
 
+// Queue [start, start + size) for each entry of ranges[] in order, end the
+// batch and check that exactly the expected invalidates were pushed. A NULL
+// expected array means the batch must fall back to a single invalidate all.
+typedef struct
+{
+    NvU64 start;
+    NvU64 size;
+    NvU64 page_sizes;
+} test_tlb_range_t;
+
+static NV_STATUS test_tlb_batch_coalesce_case(uvm_page_tree_t *tree,
+                                              uvm_push_t *push,
+                                              const test_tlb_range_t *ranges,
+                                              NvU32 num_ranges,
+                                              const test_tlb_range_t *expected,
+                                              NvU32 num_expected)
+{
+    uvm_tlb_batch_t batch;
+    NvU32 i;
+
+    fake_tlb_invals_reset();
+
+    uvm_tlb_batch_begin(tree, &batch);
+    for (i = 0; i < num_ranges; ++i)
+        uvm_tlb_batch_invalidate(&batch, ranges[i].start, ranges[i].size, ranges[i].page_sizes, UVM_MEMBAR_NONE);
+    uvm_tlb_batch_end(&batch, push, UVM_MEMBAR_NONE);
+
+    if (!expected) {
+        NvU64 max_page_size = 1ULL << __fls(ranges[0].page_sizes);
+
+        if (!assert_last_invalidate_all(tree->hal->page_table_depth(max_page_size), false))
+            return NV_ERR_INVALID_STATE;
+
+        return NV_OK;
+    }
+
+    if (g_fake_invals_count != num_expected) {
+        UVM_TEST_PRINT("Expected %u invalidates, got %u\n", num_expected, g_fake_invals_count);
+        return NV_ERR_INVALID_STATE;
+    }
+
+    for (i = 0; i < num_expected; ++i) {
+        NvU64 min_page_size = 1ULL << __ffs(expected[i].page_sizes);
+        NvU64 max_page_size = 1ULL << __fls(expected[i].page_sizes);
+
+        if (!assert_invalidate_range_specific(&g_fake_invals[i],
+                                              expected[i].start,
+                                              expected[i].size,
+                                              min_page_size,
+                                              tree->hal->page_table_depth(max_page_size),
+                                              false))
+            return NV_ERR_INVALID_STATE;
+    }
+
+    return NV_OK;
+}
+
+// Ranges queued one page at a time must merge into a single targeted
+// invalidate instead of overflowing UVM_TLB_BATCH_MAX_ENTRIES and falling back
+// to invalidating the whole tree. Only ranges with the same page sizes that
+// overlap or touch the previously queued range are merged.
+static NV_STATUS test_tlb_batch_coalesce(uvm_gpu_t *gpu)
+{
+    NV_STATUS status = NV_OK;
+    uvm_page_tree_t tree;
+    uvm_push_t push;
+    test_tlb_range_t *ranges;
+    test_tlb_range_t expected[2];
+    const NvU64 base = 16 * UVM_PAGE_SIZE_2M;
+    const NvU64 k4 = UVM_PAGE_SIZE_4K;
+    const NvU64 k64 = UVM_PAGE_SIZE_64K;
+    NvU32 i;
+
+    // The module parameter can be flipped at runtime. Nothing to check if
+    // merging is turned off.
+    if (!uvm_tlb_batch_coalesce_enabled())
+        return NV_OK;
+
+    // Kept off the stack, the push and page tree are already large
+    ranges = uvm_kvmalloc_zero(sizeof(*ranges) * 32);
+    if (!ranges)
+        return NV_ERR_NO_MEMORY;
+
+    TEST_NV_CHECK_GOTO(test_page_tree_init(gpu, &tree), done_ranges);
+    TEST_NV_CHECK_GOTO(uvm_push_begin_fake(gpu, &push), done_tree);
+
+    fake_tlb_invals_enable();
+
+    // 32 adjacent 4K pages, ascending: one 128K invalidate
+    for (i = 0; i < 32; ++i)
+        ranges[i] = (test_tlb_range_t){ base + i * k4, k4, k4 };
+    expected[0] = (test_tlb_range_t){ base, 32 * k4, k4 };
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree, &push, ranges, 32, expected, 1), done);
+
+    // 32 adjacent 64K big pages: one 2M invalidate at the 64K depth
+    for (i = 0; i < 32; ++i)
+        ranges[i] = (test_tlb_range_t){ base + i * k64, k64, k64 };
+    expected[0] = (test_tlb_range_t){ base, 32 * k64, k64 };
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree, &push, ranges, 32, expected, 1), done);
+
+    // Descending, overlapping and duplicate ranges merge into their union
+    ranges[0] = (test_tlb_range_t){ base + 4 * k4, k4,     k4 };
+    ranges[1] = (test_tlb_range_t){ base + 2 * k4, 3 * k4, k4 };
+    ranges[2] = (test_tlb_range_t){ base + 2 * k4, k4,     k4 };
+    ranges[3] = (test_tlb_range_t){ base,          2 * k4, k4 };
+    expected[0] = (test_tlb_range_t){ base, 5 * k4, k4 };
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree, &push, ranges, 4, expected, 1), done);
+
+    // A gap prevents merging
+    ranges[0] = (test_tlb_range_t){ base,          k4, k4 };
+    ranges[1] = (test_tlb_range_t){ base + 2 * k4, k4, k4 };
+    expected[0] = ranges[0];
+    expected[1] = ranges[1];
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree, &push, ranges, 2, expected, 2), done);
+
+    // Different page sizes are never merged, even when adjacent
+    ranges[0] = (test_tlb_range_t){ base,       k64, k64 };
+    ranges[1] = (test_tlb_range_t){ base + k64, k4,  k4 };
+    expected[0] = ranges[0];
+    expected[1] = ranges[1];
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree, &push, ranges, 2, expected, 2), done);
+
+    // Only the most recently queued range is a merge candidate: alternating
+    // between two runs still overflows the batch and invalidates everything.
+    for (i = 0; i < 2 * (UVM_TLB_BATCH_MAX_ENTRIES + 1); ++i) {
+        NvU64 run_base = (i & 1) ? base + UVM_PAGE_SIZE_2M : base;
+        ranges[i] = (test_tlb_range_t){ run_base + (i / 2) * k4, k4, k4 };
+    }
+    TEST_NV_CHECK_GOTO(test_tlb_batch_coalesce_case(&tree,
+                                                    &push,
+                                                    ranges,
+                                                    2 * (UVM_TLB_BATCH_MAX_ENTRIES + 1),
+                                                    NULL,
+                                                    0),
+                       done);
+
+done:
+    fake_tlb_invals_disable();
+    uvm_push_end_fake(&push);
+
+done_tree:
+    uvm_page_tree_deinit(&tree);
+
+done_ranges:
+    uvm_kvfree(ranges);
+
+    return status;
+}
+
 typedef struct
 {
     NvU64 count;
@@ -2189,6 +2338,7 @@ static NV_STATUS turing_test_page_tree(uvm_gpu_t *turing)
     MEM_NV_CHECK_RET(fast_split_double_backoff(turing), NV_OK);
     MEM_NV_CHECK_RET(test_tlb_invalidates_gmmu_v2(turing), NV_OK);
     MEM_NV_CHECK_RET(test_tlb_batch_invalidates(turing, page_sizes, num_page_sizes), NV_OK);
+    MEM_NV_CHECK_RET(test_tlb_batch_coalesce(turing), NV_OK);
 
     // Run the test again with a bigger limit on max pages
     tlb_batch_saved_max_pages = turing->parent->tlb_batch.max_pages;
@@ -2233,6 +2383,7 @@ static NV_STATUS ampere_test_page_tree(uvm_gpu_t *ampere)
 
     // TLB batch invalidate
     MEM_NV_CHECK_RET(test_tlb_batch_invalidates(ampere, page_sizes, num_page_sizes), NV_OK);
+    MEM_NV_CHECK_RET(test_tlb_batch_coalesce(ampere), NV_OK);
 
     // Run the test again with a bigger limit on max pages
     tlb_batch_saved_max_pages = ampere->parent->tlb_batch.max_pages;
@@ -2304,6 +2455,7 @@ static NV_STATUS blackwell_test_page_tree(uvm_gpu_t *blackwell)
 
         // TLB batch invalidate
         MEM_NV_CHECK_RET(test_tlb_batch_invalidates(blackwell, page_sizes, num_page_sizes), NV_OK);
+        MEM_NV_CHECK_RET(test_tlb_batch_coalesce(blackwell), NV_OK);
 
         // Run the test again with a bigger limit on max pages
         tlb_batch_saved_max_pages = blackwell->parent->tlb_batch.max_pages;

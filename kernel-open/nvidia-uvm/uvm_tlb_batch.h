@@ -56,6 +56,11 @@ struct uvm_tlb_batch_struct
     uvm_tlb_batch_range_t ranges[UVM_TLB_BATCH_MAX_ENTRIES];
     NvU32 count;
 
+    // Number of uvm_tlb_batch_invalidate() calls that were merged into an
+    // already queued range instead of using a new entry. Only used for
+    // statistics.
+    NvU32 coalesced;
+
     // Biggest page size across all queued up invalidates
     NvU64 biggest_page_size;
 
@@ -75,7 +80,18 @@ void uvm_tlb_batch_begin(uvm_page_tree_t *tree, uvm_tlb_batch_t *batch);
 // If the membar parameter is not UVM_MEMBAR_NONE, the specified membar will
 // be performed logically after the TLB invalidate such that all physical memory
 // accesses using the old translations are ordered to the scope of the membar.
+//
+// A range that overlaps or directly adjoins the most recently queued range,
+// and uses the same page sizes mask, is merged into that range instead of
+// consuming a new entry. Callers commonly queue one range per page, so this
+// keeps runs of adjacent pages from exhausting UVM_TLB_BATCH_MAX_ENTRIES and
+// falling back to invalidating the whole page tree. Merging can be disabled at
+// runtime with the uvm_perf_tlb_batch_coalesce module parameter.
 void uvm_tlb_batch_invalidate(uvm_tlb_batch_t *batch, NvU64 start, NvU64 size, NvU64 page_sizes, uvm_membar_t tlb_membar);
+
+// Returns whether uvm_tlb_batch_invalidate() currently merges adjacent ranges
+// (uvm_perf_tlb_batch_coalesce module parameter). Used by tests.
+bool uvm_tlb_batch_coalesce_enabled(void);
 
 // End a TLB invalidate batch
 //

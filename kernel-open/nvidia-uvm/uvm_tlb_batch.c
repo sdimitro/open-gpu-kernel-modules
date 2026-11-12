@@ -23,6 +23,25 @@
 
 #include "uvm_tlb_batch.h"
 #include "uvm_hal.h"
+#include "uvm_gpu.h"
+#include "uvm_linux.h"
+
+// Merge each queued range into the previous one when they overlap or touch and
+// use the same page sizes. Without merging, a run of N adjacent pages queued
+// one page at a time uses N entries, and anything beyond
+// UVM_TLB_BATCH_MAX_ENTRIES falls back to invalidating every TLB entry of the
+// page tree. Writable at runtime so the two behaviors can be compared on the
+// same build:
+//   echo 0 > /sys/module/nvidia_uvm/parameters/uvm_perf_tlb_batch_coalesce
+static int uvm_perf_tlb_batch_coalesce = 1;
+module_param(uvm_perf_tlb_batch_coalesce, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(uvm_perf_tlb_batch_coalesce,
+                 "Merge adjacent TLB invalidate ranges within a batch (1, default) or queue every range separately (0)");
+
+bool uvm_tlb_batch_coalesce_enabled(void)
+{
+    return READ_ONCE(uvm_perf_tlb_batch_coalesce) != 0;
+}
 
 void uvm_tlb_batch_begin(uvm_page_tree_t *tree, uvm_tlb_batch_t *batch)
 {
@@ -96,15 +115,75 @@ static bool tlb_batch_should_invalidate_all(uvm_tlb_batch_t *batch)
 
 void uvm_tlb_batch_end(uvm_tlb_batch_t *batch, uvm_push_t *push, uvm_membar_t tlb_membar)
 {
+    uvm_parent_gpu_t *parent_gpu;
+
     if (batch->count == 0)
         return;
 
+    parent_gpu = batch->tree->gpu->parent;
+
     batch->membar = uvm_membar_max(tlb_membar, batch->membar);
 
-    if (tlb_batch_should_invalidate_all(batch))
+    if (tlb_batch_should_invalidate_all(batch)) {
         tlb_batch_flush_invalidate_all(batch, push);
-    else
+        atomic64_inc(&parent_gpu->stats.tlb_batch.invalidate_all);
+    }
+    else {
         tlb_batch_flush_invalidate_per_va(batch, push);
+        atomic64_inc(&parent_gpu->stats.tlb_batch.targeted);
+        atomic64_add(batch->count, &parent_gpu->stats.tlb_batch.targeted_ranges);
+    }
+
+    if (batch->coalesced)
+        atomic64_add(batch->coalesced, &parent_gpu->stats.tlb_batch.coalesced);
+}
+
+// Try to merge [start, start + size) into the most recently queued range.
+//
+// Only ranges with identical page sizes masks are merged, so the merged entry
+// keeps the same TLB depth and invalidate granularity, and it covers exactly
+// the union of the two ranges. Ranges are only merged when they overlap or
+// touch, so no address outside the requested ranges is added by the merge
+// itself. (Turing+ Host rounds a ranged invalidate up to an aligned
+// power-of-two span, which can cover more than requested; invalidating extra
+// entries is always safe.)
+static bool tlb_batch_try_coalesce(uvm_tlb_batch_t *batch, NvU64 start, NvU64 size, NvU64 page_sizes)
+{
+    uvm_tlb_batch_range_t *last;
+    NvU64 end;
+    NvU64 last_end;
+    NvU64 new_start;
+    NvU64 new_end;
+
+    if (!uvm_tlb_batch_coalesce_enabled())
+        return false;
+
+    // Nothing queued to merge with, or the batch already fell back to
+    // invalidate all. In the latter case ranges[] no longer tracks the queued
+    // ranges, so leave the counting to the regular path.
+    if (batch->count == 0 || tlb_batch_should_invalidate_all(batch))
+        return false;
+
+    last = &batch->ranges[batch->count - 1];
+    if (last->page_sizes != page_sizes)
+        return false;
+
+    end = start + size;
+    last_end = last->start + last->size;
+
+    // Disjoint and not adjacent
+    if (end < last->start || start > last_end)
+        return false;
+
+    new_start = min(last->start, start);
+    new_end = max(last_end, end);
+
+    last->start = new_start;
+    last->size = new_end - new_start;
+
+    ++batch->coalesced;
+
+    return true;
 }
 
 void uvm_tlb_batch_invalidate(uvm_tlb_batch_t *batch, NvU64 start, NvU64 size, NvU64 page_sizes, uvm_membar_t tlb_membar)
@@ -112,6 +191,9 @@ void uvm_tlb_batch_invalidate(uvm_tlb_batch_t *batch, NvU64 start, NvU64 size, N
     uvm_tlb_batch_range_t *new_entry;
 
     batch->membar = uvm_membar_max(tlb_membar, batch->membar);
+
+    if (tlb_batch_try_coalesce(batch, start, size, page_sizes))
+        return;
 
     ++batch->count;
 

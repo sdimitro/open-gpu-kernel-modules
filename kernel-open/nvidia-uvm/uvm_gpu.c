@@ -587,6 +587,17 @@ static void gpu_info_print_common(uvm_gpu_t *gpu, struct seq_file *s)
     else
         UVM_SEQ_OR_DBG_PRINT(s, "closest_cpu_numa_node                  %d\n", gpu->parent->closest_cpu_numa_node);
 
+    // Counters are per parent GPU. Printed without debug procfs so TLB
+    // invalidate behavior can be measured on production builds.
+    UVM_SEQ_OR_DBG_PRINT(s, "tlb_batch_targeted                     %lld\n",
+                         atomic64_read(&gpu->parent->stats.tlb_batch.targeted));
+    UVM_SEQ_OR_DBG_PRINT(s, "tlb_batch_targeted_ranges              %lld\n",
+                         atomic64_read(&gpu->parent->stats.tlb_batch.targeted_ranges));
+    UVM_SEQ_OR_DBG_PRINT(s, "tlb_batch_invalidate_all               %lld\n",
+                         atomic64_read(&gpu->parent->stats.tlb_batch.invalidate_all));
+    UVM_SEQ_OR_DBG_PRINT(s, "tlb_batch_coalesced                    %lld\n",
+                         atomic64_read(&gpu->parent->stats.tlb_batch.coalesced));
+
     if (!uvm_procfs_is_debug_enabled())
         return;
 

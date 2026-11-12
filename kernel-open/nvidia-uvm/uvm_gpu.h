@@ -1293,6 +1293,23 @@ struct uvm_parent_gpu_struct
         atomic64_t             num_pages_out;
 
         atomic64_t              num_pages_in;
+
+        // TLB invalidate batches issued by uvm_tlb_batch_end() for any page
+        // tree on this GPU.
+        struct
+        {
+            // Batches that ended with targeted per-VA invalidates
+            atomic64_t targeted;
+
+            // Total per-VA invalidates issued by targeted batches
+            atomic64_t targeted_ranges;
+
+            // Batches that fell back to invalidating the whole page tree
+            atomic64_t invalidate_all;
+
+            // Ranges merged into an already queued range
+            atomic64_t coalesced;
+        } tlb_batch;
     } stats;
 
     // Structure to hold nvswitch specific information. In an nvswitch
