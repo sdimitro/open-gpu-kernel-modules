@@ -139,6 +139,7 @@ void        NV_API_CALL  os_enable_console_access         (void);
 NV_STATUS   NV_API_CALL  os_registry_init                 (void);
 NvU64       NV_API_CALL  os_get_max_user_va               (void);
 NV_STATUS   NV_API_CALL  os_schedule                      (void);
+void        NV_API_CALL  os_cpu_relax                     (void);
 NV_STATUS   NV_API_CALL  os_alloc_spinlock                (void **);
 void        NV_API_CALL  os_free_spinlock                 (void *);
 NvU64       NV_API_CALL  os_acquire_spinlock              (void *);

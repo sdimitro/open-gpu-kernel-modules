@@ -1338,6 +1338,16 @@ NV_STATUS NV_API_CALL os_schedule(void)
     }
 }
 
+//
+// Hint to the CPU that the caller is busy-waiting (PAUSE on x86, YIELD on
+// arm64). Used by RM polling loops so a spinning thread doesn't starve its SMT
+// sibling or hammer the memory it polls at full speed.
+//
+void NV_API_CALL os_cpu_relax(void)
+{
+    cpu_relax();
+}
+
 typedef struct {
     nv_kthread_q_item_t item;
     void *data;

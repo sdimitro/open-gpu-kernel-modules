@@ -809,7 +809,9 @@ void osReleaseRmSema(void *pSema, OBJGPU *pDpcGpu)
 
 void osSpinLoop(void)
 {
-
+    // Called from RM busy-wait loops (GSP RPC replies, register polls). Let
+    // the CPU know so the loop doesn't starve the SMT sibling.
+    os_cpu_relax();
 }
 
 NvU64 osGetMaxUserVa(void)

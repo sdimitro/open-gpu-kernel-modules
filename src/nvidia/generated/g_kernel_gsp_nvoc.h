@@ -616,6 +616,7 @@ struct KernelGsp {
     NvU32 gspHangDebugDump;
     NvU32 gspTimeoutClassification;
     NvU32 gspRpcTimeoutGpuResetThreshold;
+    NvU64 rpcPollHealthCheckIntervalNs;
     NvBool bPartitionedFmc;
     NvBool bScrubberUcodeSupported;
     NvBool bImemPagingSupported;

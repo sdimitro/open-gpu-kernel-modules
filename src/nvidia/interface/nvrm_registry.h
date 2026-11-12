@@ -3564,6 +3564,22 @@
 
 //
 // Type: DWORD
+// Minimum interval, in microseconds, between GSP-RM health checks while a CPU
+// thread busy-polls for a synchronous GSP RPC reply. Each health check reads
+// the GSP CrashCat queue PUT/GET registers over the PCIe bus. When rate
+// limited, the check is also skipped on the poll iteration that finds the
+// expected reply, and it still always runs when draining the message queue
+// fails, so GSP-RM failures are reported the same way.
+//   0       - check on every poll iteration, including after the reply has
+//             arrived (behavior before this key existed)
+//   Default - 100us
+//
+#define NV_REG_STR_RM_GSP_RPC_POLL_HEALTH_CHECK_INTERVAL_US            "RmGspRpcPollHealthCheckIntervalUs"
+#define NV_REG_STR_RM_GSP_RPC_POLL_HEALTH_CHECK_INTERVAL_US_DEFAULT    (100)
+#define NV_REG_STR_RM_GSP_RPC_POLL_HEALTH_CHECK_INTERVAL_US_EVERY_POLL (0)
+
+//
+// Type: DWORD
 // Enable/disable the periodic GSP health check.
 //
 // Values:

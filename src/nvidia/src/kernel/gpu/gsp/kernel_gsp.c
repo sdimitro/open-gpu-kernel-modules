@@ -216,7 +216,8 @@ static NV_STATUS _kgspConstructRpcObject(OBJGPU *, KernelGsp *, MESSAGE_QUEUE_IN
 static NV_STATUS _kgspRpcSendMessage(OBJGPU *, OBJRPC *, NvU32 *);
 static NV_STATUS _kgspRpcRecvPoll(OBJGPU *, OBJRPC *, NvU32, NvU32);
 static NV_STATUS _kgspRpcDrainEvents(OBJGPU *, KernelGsp *, NvU32, NvU32, KernelGspRpcEventHandlerContext,
-                                     GpuWaitConditionFunc *pConditionFunc, void *pConditionData);
+                                     GpuWaitConditionFunc *pConditionFunc, void *pConditionData,
+                                     NvU64 *pNextHealthCheckNs);
 static void      _kgspRpcIncrementTimeoutCountAndRateLimitPrints(OBJGPU *, OBJRPC *);
 
 static NV_STATUS _kgspAllocSimAccessBuffer(OBJGPU *pGpu, KernelGsp *pKernelGsp);
@@ -2140,10 +2141,60 @@ _kgspRpcDrainOneEvent
 }
 
 /*!
+ * Decide whether _kgspRpcDrainEvents() should run kgspHealthCheck_HAL() now.
+ *
+ * The health check reads the GSP CrashCat queue PUT/GET registers, two
+ * uncached PCIe reads that typically cost 1-2us together. Running it on every
+ * iteration of the RPC poll loop adds that cost to every synchronous RPC, even
+ * after the reply has already arrived, and sets the polling cadence. While
+ * polling, rate limit it to RmGspRpcPollHealthCheckIntervalUs instead:
+ *
+ *  - Always check when not polling (pNextHealthCheckNs is NULL), when the
+ *    regkey is 0, or when draining the queue failed, so failures are still
+ *    classified as NV_ERR_RESET_REQUIRED exactly as before.
+ *  - Skip the check when the expected reply is in the staging area: GSP-RM was
+ *    alive to send it, and the next poll or the periodic health check will
+ *    notice any later failure.
+ *  - Otherwise check at most once per interval. RPC timeouts are seconds long,
+ *    so a dead GSP-RM is still detected within one interval.
+ */
+static NvBool
+_kgspRpcPollShouldHealthCheck
+(
+    KernelGsp *pKernelGsp,
+    NV_STATUS  drainStatus,
+    NvU64     *pNextHealthCheckNs
+)
+{
+    NvU64 now;
+
+    if ((pNextHealthCheckNs == NULL) || (pKernelGsp->rpcPollHealthCheckIntervalNs == 0))
+        return NV_TRUE;
+
+    if (drainStatus == NV_WARN_MORE_PROCESSING_REQUIRED)
+        return NV_FALSE;
+
+    if ((drainStatus != NV_OK) && (drainStatus != NV_WARN_NOTHING_TO_DO))
+        return NV_TRUE;
+
+    now = osGetMonotonicTimeNs();
+    if (now < *pNextHealthCheckNs)
+        return NV_FALSE;
+
+    *pNextHealthCheckNs = now + pKernelGsp->rpcPollHealthCheckIntervalNs;
+    return NV_TRUE;
+}
+
+/*!
  * Handle RPC events from GSP until the event is [an RPC return for] expectedFunc,
  * or there are no events available in the buffer.
  *
  * Also dump GSP logs, and check for severe errors coming from GSP.
+ *
+ * @param[in,out] pNextHealthCheckNs
+ *   NULL to check GSP-RM health on every call. Otherwise the monotonic time
+ *   before which the health check may be skipped; see
+ *   _kgspRpcPollShouldHealthCheck().
  *
  * @return
  *   NV_OK                              if one or more events are handled and there are none left.
@@ -2160,7 +2211,8 @@ _kgspRpcDrainEvents
     NvU32      expectedSequence,
     KernelGspRpcEventHandlerContext rpcHandlerContext,
     GpuWaitConditionFunc *pConditionFunc,
-    void                 *pConditionData
+    void                 *pConditionData,
+    NvU64                *pNextHealthCheckNs
 )
 {
     NV_STATUS nvStatus = NV_OK;
@@ -2174,8 +2226,11 @@ _kgspRpcDrainEvents
     }
 
     // If GSP-RM has died, the GPU will need to be reset
-    if (!kgspHealthCheck_HAL(pGpu, pKernelGsp))
+    if (_kgspRpcPollShouldHealthCheck(pKernelGsp, nvStatus, pNextHealthCheckNs) &&
+        !kgspHealthCheck_HAL(pGpu, pKernelGsp))
+    {
         return NV_ERR_RESET_REQUIRED;
+    }
 
     if (nvStatus == NV_WARN_NOTHING_TO_DO)
         nvStatus = NV_OK;
@@ -3945,6 +4000,7 @@ kgspRecvPoll_IMPL
     NvU32      timeoutFlags;
     NvBool     bSlowGspRpc = !IS_SILICON(pGpu);
     NvU32      gpuMaskUnused;
+    NvU64      nextHealthCheckNs;
 
     KernelGspRpcEventHandlerContext rpcHandlerContext = KGSP_RPC_EVENT_HANDLER_CONTEXT_POLL;
     if (expectedFunc == GMCAPI_CMD_GSP_RESUME_DONE ||
@@ -4010,6 +4066,12 @@ kgspRecvPoll_IMPL
 
     gpuSetTimeout(pGpu, timeoutUs, &timeout, timeoutFlags);
 
+    //
+    // The first health check is due one interval from now, so RPCs that
+    // complete within the interval do no health-check register reads at all.
+    //
+    nextHealthCheckNs = osGetMonotonicTimeNs() + pKernelGsp->rpcPollHealthCheckIntervalNs;
+
     for (;;)
     {
         //
@@ -4019,7 +4081,7 @@ kgspRecvPoll_IMPL
         timeoutStatus = gpuCheckTimeout(pGpu, &timeout);
 
         rpcStatus = _kgspRpcDrainEvents(pGpu, pKernelGsp, expectedFunc, expectedSequence, rpcHandlerContext,
-                                        pConditionFunc, pConditionData);
+                                        pConditionFunc, pConditionData, &nextHealthCheckNs);
 
         switch (rpcStatus) {
             case NV_WARN_MORE_PROCESSING_REQUIRED:
@@ -5760,6 +5822,12 @@ _kgspReadRegkeyOverrides(OBJGPU *pGpu, KernelGsp *pKernelGsp)
     {
         pKernelGsp->gspTimeoutClassification = NV_REG_STR_RM_GSP_TIMEOUT_CLASSIFICATION_DEFAULT;
     }
+
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_GSP_RPC_POLL_HEALTH_CHECK_INTERVAL_US, &data32) != NV_OK)
+    {
+        data32 = NV_REG_STR_RM_GSP_RPC_POLL_HEALTH_CHECK_INTERVAL_US_DEFAULT;
+    }
+    pKernelGsp->rpcPollHealthCheckIntervalNs = (NvU64)data32 * 1000;
 
     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_GSP_RPC_TIMEOUT_GPU_RESET_THRESHOLD, &pKernelGsp->gspRpcTimeoutGpuResetThreshold) != NV_OK)
     {
@@ -8437,7 +8505,7 @@ kgspRpcRecvEvents_IMPL
     // If we do the assert will fail on NV_WARN_MORE_PROCESSING_REQUIRED,
     // in addition to general error codes.
     //
-    NV_ASSERT_OK(_kgspRpcDrainEvents(pGpu, pKernelGsp, NV_VGPU_MSG_FUNCTION_NUM_FUNCTIONS, 0, KGSP_RPC_EVENT_HANDLER_CONTEXT_INTERRUPT, NULL, NULL));
+    NV_ASSERT_OK(_kgspRpcDrainEvents(pGpu, pKernelGsp, NV_VGPU_MSG_FUNCTION_NUM_FUNCTIONS, 0, KGSP_RPC_EVENT_HANDLER_CONTEXT_INTERRUPT, NULL, NULL, NULL));
 }
 
 /*!
