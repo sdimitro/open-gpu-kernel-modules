@@ -1,0 +1,55 @@
+#!/usr/bin/env bpftrace
+/*
+ * Count GPU TLB invalidates issued by nvidia-uvm.
+ *
+ * Only probes functions that exist in both the stock driver and the patched
+ * one, so the same script measures either build:
+ *
+ *   uvm_tlb_batch_end()                        one call per TLB batch
+ *   uvm_hal_<arch>_host_tlb_invalidate_all()   invalidate every cached
+ *                                              translation of a VA space
+ *   uvm_hal_<arch>_host_tlb_invalidate_va()    targeted (ranged) invalidate
+ *
+ * The number that matters is invalidate_all per batch. With range merging
+ * (uvm_perf_tlb_batch_coalesce=1) runs of adjacent pages become one targeted
+ * invalidate, so invalidate_all should drop sharply on workloads that map or
+ * revoke runs of 4K/64K pages.
+ *
+ * Usage:
+ *   sudo bpftrace uvm_tlb_invalidates.bt                 # until Ctrl-C
+ *   sudo bpftrace uvm_tlb_invalidates.bt -c './bench ...'  # for one command
+ */
+
+BEGIN
+{
+    printf("Tracing nvidia-uvm TLB invalidates, Ctrl-C to stop\n");
+}
+
+kprobe:uvm_tlb_batch_end
+{
+    @tlb_batch_end_calls = count();
+}
+
+kprobe:uvm_hal_*_host_tlb_invalidate_all
+{
+    @invalidate_all = count();
+    @invalidate_all_by_hal[func] = count();
+}
+
+kprobe:uvm_hal_*_host_tlb_invalidate_va
+{
+    @invalidate_va = count();
+}
+
+END
+{
+    printf("\n--- nvidia-uvm TLB invalidates ---\n");
+    print(@tlb_batch_end_calls);
+    print(@invalidate_all);
+    print(@invalidate_va);
+    print(@invalidate_all_by_hal);
+    clear(@tlb_batch_end_calls);
+    clear(@invalidate_all);
+    clear(@invalidate_va);
+    clear(@invalidate_all_by_hal);
+}

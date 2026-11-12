@@ -1,0 +1,96 @@
+#!/usr/bin/env bpftrace
+/*
+ * Measure how long RM threads spend waiting for synchronous GSP RPC replies,
+ * and how many GSP health checks they run while waiting.
+ *
+ * Only probes functions that exist in both the stock driver and the patched
+ * one, so the same script measures either build:
+ *
+ *   kgspRecvPoll_IMPL()       busy-wait for one RPC reply
+ *   kgspHealthCheck_TU102()   GSP health check (2 PCIe register reads via
+ *                             crashcatQueueConsumeNextReport_V1)
+ *   rm_ioctl()                one RM ioctl from user space, end to end
+ *
+ * Expected effect of "rm/gsp: stop health-checking GSP on every RPC poll
+ * iteration": health_checks_in_rpc_poll per RPC goes from >= 1 (one per poll
+ * iteration, at least one after the reply arrived) to ~0 for RPCs shorter
+ * than the 100us interval, and rpc_wait_ns average drops by roughly the cost
+ * of the skipped register reads.
+ *
+ * Usage:
+ *   sudo bpftrace gsp_rpc_poll.bt -c './nvml_rpc_bench -p 1 -t 10'
+ */
+
+BEGIN
+{
+    printf("Tracing GSP RPC polling, Ctrl-C to stop\n");
+}
+
+kprobe:kgspRecvPoll_IMPL
+{
+    @poll_start[tid] = nsecs;
+}
+
+kretprobe:kgspRecvPoll_IMPL
+/@poll_start[tid]/
+{
+    $d = nsecs - @poll_start[tid];
+
+    @rpc_wait_ns = stats($d);
+    // Linear 1us buckets: a 1-2us shift is invisible in power-of-2 buckets
+    @rpc_wait_us = lhist($d / 1000, 0, 100, 1);
+
+    delete(@poll_start[tid]);
+}
+
+kprobe:kgspHealthCheck_TU102
+{
+    @health_checks_total = count();
+
+    if (@poll_start[tid]) {
+        @health_checks_in_rpc_poll = count();
+    }
+}
+
+kprobe:crashcatQueueConsumeNextReport_V1
+{
+    @crashcat_queue_reads = count();
+}
+
+kprobe:rm_ioctl
+{
+    @ioctl_start[tid] = nsecs;
+}
+
+kretprobe:rm_ioctl
+/@ioctl_start[tid]/
+{
+    $d = nsecs - @ioctl_start[tid];
+
+    @rm_ioctl_ns = stats($d);
+    @rm_ioctl_us = lhist($d / 1000, 0, 200, 2);
+
+    delete(@ioctl_start[tid]);
+}
+
+END
+{
+    printf("\n--- GSP RPC polling ---\n");
+    print(@rpc_wait_ns);
+    print(@health_checks_in_rpc_poll);
+    print(@health_checks_total);
+    print(@crashcat_queue_reads);
+    print(@rm_ioctl_ns);
+    print(@rpc_wait_us);
+    print(@rm_ioctl_us);
+
+    clear(@poll_start);
+    clear(@ioctl_start);
+    clear(@rpc_wait_ns);
+    clear(@rpc_wait_us);
+    clear(@health_checks_in_rpc_poll);
+    clear(@health_checks_total);
+    clear(@crashcat_queue_reads);
+    clear(@rm_ioctl_ns);
+    clear(@rm_ioctl_us);
+}

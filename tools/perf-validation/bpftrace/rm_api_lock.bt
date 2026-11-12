@@ -1,0 +1,93 @@
+#!/usr/bin/env bpftrace
+/*
+ * Measure RM API lock acquire wait and hold times, split by requested mode.
+ *
+ * Only probes functions that exist in both the stock driver and the patched
+ * one, so the same script measures either build:
+ *
+ *   rmapiLockAcquire(flags, module)   arg0 bit 1 = RMAPI_LOCK_FLAGS_READ
+ *   rmapiLockRelease()
+ *
+ * "read" means read mode was requested. RM silently upgrades a read request
+ * to write for modules not in RmRoApiLockModule (the default allows the
+ * client module, which covers read-only RM controls from user space).
+ *
+ * Use this to confirm a load is dominated by read-mode acquires before
+ * comparing RmApiLockTraceReaders=1 (old) against the default (new). The
+ * contention itself is easiest to see with `perf c2c` (see README.md); this
+ * script shows its effect on acquire and hold times.
+ *
+ * Usage:
+ *   sudo bpftrace rm_api_lock.bt -c './nvml_rpc_bench -p 32 -t 10'
+ */
+
+BEGIN
+{
+    printf("Tracing RM API lock, Ctrl-C to stop\n");
+}
+
+kprobe:rmapiLockAcquire
+{
+    @acq_start[tid] = nsecs;
+    @acq_read[tid] = (arg0 & 0x2) ? 1 : 0;
+}
+
+kretprobe:rmapiLockAcquire
+/@acq_start[tid]/
+{
+    $wait = nsecs - @acq_start[tid];
+
+    if (@acq_read[tid]) {
+        @acquire_wait_ns_read = stats($wait);
+        @acquire_wait_us_read = hist($wait / 1000);
+    } else {
+        @acquire_wait_ns_write = stats($wait);
+        @acquire_wait_us_write = hist($wait / 1000);
+    }
+
+    // Only successful acquires are followed by a release
+    if (retval == 0) {
+        @held_since[tid] = nsecs;
+        @held_read[tid] = @acq_read[tid];
+    }
+
+    delete(@acq_start[tid]);
+    delete(@acq_read[tid]);
+}
+
+kprobe:rmapiLockRelease
+/@held_since[tid]/
+{
+    $hold = nsecs - @held_since[tid];
+
+    if (@held_read[tid]) {
+        @hold_ns_read = stats($hold);
+    } else {
+        @hold_ns_write = stats($hold);
+    }
+
+    delete(@held_since[tid]);
+    delete(@held_read[tid]);
+}
+
+END
+{
+    printf("\n--- RM API lock ---\n");
+    print(@acquire_wait_ns_read);
+    print(@acquire_wait_ns_write);
+    print(@hold_ns_read);
+    print(@hold_ns_write);
+    print(@acquire_wait_us_read);
+    print(@acquire_wait_us_write);
+
+    clear(@acq_start);
+    clear(@acq_read);
+    clear(@held_since);
+    clear(@held_read);
+    clear(@acquire_wait_ns_read);
+    clear(@acquire_wait_ns_write);
+    clear(@acquire_wait_us_read);
+    clear(@acquire_wait_us_write);
+    clear(@hold_ns_read);
+    clear(@hold_ns_write);
+}
