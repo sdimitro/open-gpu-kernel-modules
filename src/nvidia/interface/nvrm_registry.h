@@ -894,6 +894,19 @@
 #define NV_REG_STR_RM_LOCKING_LOW_PRIORITY_AGING              "RMLockingLowPriorityAging"
 
 //
+// Type: DWORD
+// Record read-mode RM API lock acquires and releases in the API lock trace
+// ring, in addition to write-mode ones. All readers write the same global
+// ring, so enabling this makes concurrent readers bounce its cache lines.
+//   0 - trace write-mode acquires/releases only (default)
+//   1 - trace every acquire/release (behavior before this key existed)
+//
+#define NV_REG_STR_RM_API_LOCK_TRACE_READERS                  "RmApiLockTraceReaders"
+#define NV_REG_STR_RM_API_LOCK_TRACE_READERS_DISABLE          (0x00000000)
+#define NV_REG_STR_RM_API_LOCK_TRACE_READERS_ENABLE           (0x00000001)
+#define NV_REG_STR_RM_API_LOCK_TRACE_READERS_DEFAULT          NV_REG_STR_RM_API_LOCK_TRACE_READERS_DISABLE
+
+//
 // Type DWORD
 // This regkey restricts profiling capabilities (creation of profiling objects
 // and access to profiling-related registers) to admin only.

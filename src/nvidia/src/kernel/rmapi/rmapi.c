@@ -50,6 +50,16 @@ typedef struct
     PORT_ATOMIC NvU64   totalWaitTime;
     PORT_ATOMIC NvU64   totalRwHoldTime;
     PORT_ATOMIC NvU64   totalRoHoldTime;
+
+    //
+    // Record read-mode acquires and releases in traceInfo as well. Off by
+    // default: concurrent readers would all write the same global ring and
+    // index, bouncing those cache lines between CPUs and serializing readers
+    // that the RW lock otherwise lets run in parallel. The unlocked index
+    // update also races between readers, so their records were unreliable.
+    // See NV_REG_STR_RM_API_LOCK_TRACE_READERS.
+    //
+    NvBool              bTraceReaders;
 } RMAPI_LOCK;
 
 RsServer          g_resServ;
@@ -538,6 +548,14 @@ _rmapiLockAlloc(void)
 
     g_RmApiLock.tlsEntryId = tlsEntryAlloc();
 
+    // Read after the portMemSet() above, which would clear it
+    if ((osReadRegistryDword(NULL,
+                            NV_REG_STR_RM_API_LOCK_TRACE_READERS,
+                            &val) == NV_OK))
+    {
+        g_RmApiLock.bTraceReaders = (val == NV_REG_STR_RM_API_LOCK_TRACE_READERS_ENABLE);
+    }
+
     return NV_OK;
 }
 
@@ -659,15 +677,22 @@ rmapiLockAcquire(NvU32 flags, NvU32 module)
         // save off owning thread
         RMTRACE_RMLOCK(_API_LOCK_ACQUIRE);
 
-        // add api lock trace record
-        INSERT_LOCK_TRACE(&g_RmApiLock.traceInfo,
-                          NV_RETURN_ADDRESS(),
-                          lockTraceAcquire,
-                          flags, module,
-                          threadId,
-                          !portSyncExSafeToSleep(),
-                          myPriority,
-                          timestamp);
+        //
+        // Add api lock trace record. Only writers by default: a writer owns
+        // the lock exclusively, so its record is race free and costs nothing
+        // extra in sharing. See RMAPI_LOCK::bTraceReaders.
+        //
+        if ((g_RmApiLock.threadId == threadId) || g_RmApiLock.bTraceReaders)
+        {
+            INSERT_LOCK_TRACE(&g_RmApiLock.traceInfo,
+                              NV_RETURN_ADDRESS(),
+                              lockTraceAcquire,
+                              flags, module,
+                              threadId,
+                              !portSyncExSafeToSleep(),
+                              myPriority,
+                              timestamp);
+        }
 
         //
         // If enabled, reset the timeout now that we are running and off
@@ -689,7 +714,9 @@ rmapiLockAcquire(NvU32 flags, NvU32 module)
             // and released after they are which could lead to uninitialized memory
             // being present in TLS.
             //
-            *(NvU64*)pStartTime = osGetMonotonicTimeNs();
+            // Reuse the acquire timestamp instead of reading the clock again.
+            //
+            *(NvU64*)pStartTime = timestamp;
         }
         else
         {
@@ -707,28 +734,41 @@ rmapiLockRelease(void)
 {
     OBJSYS *pSys = SYS_GET_INSTANCE();
     NvU64 threadId = portThreadGetCurrentThreadId();
-    NvU64 timestamp;
+    NvBool bCollectTimes = pSys->getProperty(pSys, PDB_PROP_SYS_RM_LOCK_TIME_COLLECT);
+    //
+    // If the threadId in the global is same as current thread id, then we know
+    // that it was acquired in WRITE mode. The lock is still held here, so no
+    // writer can change it underneath a reader.
+    //
+    NvBool bWriteMode = (g_RmApiLock.threadId == threadId);
+    NvBool bTrace = bWriteMode || g_RmApiLock.bTraceReaders;
+    NvU64 timestamp = 0;
     NvU64 startTime = 0;
 
     // Fetch start of hold time from TLS if measuring lock times
-    if (pSys->getProperty(pSys, PDB_PROP_SYS_RM_LOCK_TIME_COLLECT))
+    if (bCollectTimes)
         startTime = (NvU64) tlsEntryGet(g_RmApiLock.tlsEntryId);
 
-    timestamp = osGetMonotonicTimeNs();
+    // Readers only need the clock for tracing or lock time statistics
+    if (bTrace || bCollectTimes)
+        timestamp = osGetMonotonicTimeNs();
 
     RMTRACE_RMLOCK(_API_LOCK_RELEASE);
 
-    // add api lock trace record
-    INSERT_LOCK_TRACE(&g_RmApiLock.traceInfo,
-                      NV_RETURN_ADDRESS(),
-                      lockTraceRelease,
-                      0, 0,
-                      threadId,
-                      !portSyncExSafeToSleep(),
-                      0,
-                      timestamp);
+    // add api lock trace record, see RMAPI_LOCK::bTraceReaders
+    if (bTrace)
+    {
+        INSERT_LOCK_TRACE(&g_RmApiLock.traceInfo,
+                          NV_RETURN_ADDRESS(),
+                          lockTraceRelease,
+                          0, 0,
+                          threadId,
+                          !portSyncExSafeToSleep(),
+                          0,
+                          timestamp);
+    }
 
-    if (g_RmApiLock.threadId == threadId)
+    if (bWriteMode)
     {
         //
         // If the threadId in the global is same as current thread id, then
@@ -738,7 +778,7 @@ rmapiLockRelease(void)
         g_RmApiLock.timestamp = timestamp;
 
         // Update total RW API lock hold time if measuring lock times
-        if (pSys->getProperty(pSys, PDB_PROP_SYS_RM_LOCK_TIME_COLLECT) && startTime != 0)
+        if (bCollectTimes && startTime != 0)
             portAtomicExAddU64(&g_RmApiLock.totalRwHoldTime, timestamp - startTime);
 
         portSyncRwLockReleaseWrite(g_RmApiLock.pLock);
@@ -747,7 +787,7 @@ rmapiLockRelease(void)
     else
     {
         // Update total RO API lock hold time if measuring lock times
-        if (pSys->getProperty(pSys, PDB_PROP_SYS_RM_LOCK_TIME_COLLECT) && startTime != 0)
+        if (bCollectTimes && startTime != 0)
             portAtomicExAddU64(&g_RmApiLock.totalRoHoldTime, timestamp - startTime);
 
         portSyncRwLockReleaseRead(g_RmApiLock.pLock);
