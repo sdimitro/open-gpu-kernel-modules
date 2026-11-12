@@ -527,13 +527,6 @@ _rmapiLockAlloc(void)
     NvU32 val = 0;
 
     if ((osReadRegistryDword(NULL,
-                            NV_REG_STR_RM_LOCKING_LOW_PRIORITY_AGING,
-                            &val) == NV_OK))
-    {
-        g_RmApiLock.lowPriorityAging = val;
-    }
-
-    if ((osReadRegistryDword(NULL,
                             NV_REG_STR_RM_PARAM_COPY_NO_LOCK,
                             &val) == NV_OK))
     {
@@ -548,7 +541,17 @@ _rmapiLockAlloc(void)
 
     g_RmApiLock.tlsEntryId = tlsEntryAlloc();
 
-    // Read after the portMemSet() above, which would clear it
+    //
+    // g_RmApiLock regkeys must be read after the portMemSet() above, which
+    // clears the whole structure.
+    //
+    if ((osReadRegistryDword(NULL,
+                            NV_REG_STR_RM_LOCKING_LOW_PRIORITY_AGING,
+                            &val) == NV_OK))
+    {
+        g_RmApiLock.lowPriorityAging = val;
+    }
+
     if ((osReadRegistryDword(NULL,
                             NV_REG_STR_RM_API_LOCK_TRACE_READERS,
                             &val) == NV_OK))
